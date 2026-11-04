@@ -272,6 +272,14 @@ def test_ep_dispatcher_and_topo_mesh_options():
         tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))
 
 
+def test_tie_embeddings_option():
+    assert get_tpu_engine_options(_cfg()).tie_embeddings is None  # off: the torchtitan model config decides
+    assert get_tpu_engine_options(_cfg({"tie_embeddings": "true"})).tie_embeddings is True
+    assert get_tpu_engine_options(_cfg({"tie_embeddings": False})).tie_embeddings is False
+    with pytest.raises(ValueError, match="Invalid TPU engine option tie_embeddings"):
+        get_tpu_engine_options(_cfg({"tie_embeddings": "maybe"}))
+
+
 def test_ac_save_splash_and_routing_option():
     from types import SimpleNamespace
 

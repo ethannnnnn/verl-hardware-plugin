@@ -237,6 +237,10 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        tie_embeddings: Train with one weight shared by the input embedding and the LM head, as in checkpoints with
+            ``tie_word_embeddings=true``, also for models whose torchtitan config trains a separate LM head (e.g.
+            Qwen3.5-0.8B; see ``engines/tied_embeddings.py``). Unset or ``False`` (default) keeps the torchtitan
+            config's own choice.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -272,6 +276,7 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    tie_embeddings: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -308,6 +313,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "tie_embeddings": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
