@@ -73,6 +73,10 @@ from verl_hardware_plugin.accelerators.tpu.engines import (
     tpu_model_kernels,
     tpu_ragged_ep,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.embed_head_grad_accum import (
+    accumulate_embed_head_grads,
+    validate_embed_head_accum,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -1076,6 +1080,13 @@ class TorchTitanTPUEngine(BaseEngine):
             )
             logger.warning("torch.compile(backend='tpu') enabled on %d modules", n_compiled)
 
+        # engine_kwargs.tpu.embed_head_accum (engines/embed_head_grad_accum.py): checked here, so an unsupported
+        # layout fails at start-up instead of in the first training step.
+        self._embed_head_accum = bool(tpu_options.embed_head_accum) and not self.engine_config.forward_only
+        if self._embed_head_accum:
+            names = validate_embed_head_accum(model_parts, use_simple_fsdp=self._use_simple_fsdp)
+            logger.warning("embed_head_accum: %s gradients are reduce-scattered once per step", ", ".join(names))
+
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
@@ -1388,7 +1399,20 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+        # engine_kwargs.tpu.embed_head_accum: the embedding / LM head gradients of the training micro-batches are
+        # accumulated locally and reduce-scattered once, after the loop.
+        embed_head_ctx = (
+            accumulate_embed_head_grads(
+                self.module,
+                expected_micro_batches=len(micro_batches),
+                collective_context=self.trainer.train_context,
+                synchronize=functools.partial(tpu_synchronize, wait=True),
+            )
+            if getattr(self, "_embed_head_accum", False) and not forward_only and micro_batches
+            else nullcontext()
+        )
+
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), embed_head_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     output = self._forward_backward_micro_batch(micro_batch, loss_function, forward_only)
