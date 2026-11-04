@@ -17,7 +17,7 @@ import sys
 import types
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 from unittest import mock
 
 import pytest
@@ -256,7 +256,7 @@ def _accumulation_worker(rank: int, world: int, init_file: str, backend: str) ->
         n_mb = 3
         for tied in (False, True):
             for param_dtype, reduce_dtype in ((torch.bfloat16, torch.float32), (None, None)):
-                kw = dict(tied=tied, param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+                kw: dict[str, Any] = dict(tied=tied, param_dtype=param_dtype, reduce_dtype=reduce_dtype)
                 ref, model = _build(simple_fsdp, mesh, **kw), _build(simple_fsdp, mesh, **kw)
                 batches = _batches(rank, n_mb)
                 groups = eh.plan_embed_head_grad_accumulation([model])
@@ -373,7 +373,8 @@ def _engine_worker(rank: int, world: int, init_file: str) -> None:
         seen: list = []
 
         def run(model, *, accumulate: bool, forward_only: bool):
-            engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngine)
+            # A bare engine whose collaborators are replaced below.
+            engine: Any = object.__new__(torchtitan_tpu.TorchTitanTPUEngine)
             engine.engine_config = SimpleNamespace(
                 tensor_parallel_size=1, context_parallel_size=1, engine_kwargs={}, pad_to_length=False
             )
