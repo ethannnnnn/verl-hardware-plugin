@@ -116,6 +116,18 @@ def has_moe_layers(model_config: Any) -> bool:
     return any(True for _ in model_config.traverse(MoE.Config))
 
 
+def _moe_kernels_without_moe_layers(kernels: frozenset[str] | set[str], model_config: Any) -> frozenset[str]:
+    """The MoE kernels in ``kernels`` if ``model_config`` has no MoE layers for them (a dense flavor), else none.
+
+    Looks at ``model_config`` only if ``kernels`` has a MoE kernel, so that a request without one (e.g. ``none``)
+    never does. ``model_config=None`` skips the check.
+    """
+    moe = _MOE_KERNELS & kernels
+    if not moe or model_config is None or has_moe_layers(model_config):
+        return frozenset()
+    return moe
+
+
 def resolve_tpu_model_kernels(
     torchtitan_name: str, requested: Optional[str] = None, model_config: Any = None
 ) -> frozenset[str]:
@@ -129,23 +141,22 @@ def resolve_tpu_model_kernels(
             ``model_config`` does not have, or that the installed torchtitan does not provide.
     """
     supported = _SUPPORTED_KERNELS.get(torchtitan_name, frozenset())
-    # The kernels of the model that this flavor cannot run: the MoE kernels of a dense flavor.
-    dense = model_config is not None and bool(supported & _MOE_KERNELS) and not has_moe_layers(model_config)
-    inapplicable = supported & _MOE_KERNELS if dense else frozenset()
     raw = (requested or "").strip().lower()
     if not raw or raw == "auto":
-        return _available_kernels(torchtitan_name) & (supported - inapplicable)
+        kernels = _available_kernels(torchtitan_name) & supported
+        return kernels - _moe_kernels_without_moe_layers(kernels, model_config)
     names = {k.strip() for k in raw.split(",") if k.strip()}
     if names <= {"none", "off", "false", "0"}:
         return frozenset()
     if "all" in names:
-        names = set(supported - inapplicable)
+        names = set(supported - _moe_kernels_without_moe_layers(supported, model_config))
     unknown = names - supported
     if unknown:
         raise ValueError(f"engine_kwargs.tpu.model_kernels: {sorted(unknown)} not supported for {torchtitan_name}")
-    if names & inapplicable:
+    inapplicable = _moe_kernels_without_moe_layers(names, model_config)
+    if inapplicable:
         raise ValueError(
-            f"engine_kwargs.tpu.model_kernels: {sorted(names & inapplicable)} needs MoE layers, but this "
+            f"engine_kwargs.tpu.model_kernels: {sorted(inapplicable)} needs MoE layers, but this "
             f"{torchtitan_name} flavor has none (dense); remove it or use 'auto'"
         )
     missing = names - _available_kernels(torchtitan_name)

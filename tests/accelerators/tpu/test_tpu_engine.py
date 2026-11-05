@@ -1762,11 +1762,18 @@ def test_model_kernels_auto_leaves_moe_out_of_dense_qwen3_5(monkeypatch):
         assert resolve("qwen3_5", "all", model_config=dense_config) == {"kda", "lce"}
         assert resolve("qwen3_5", "all", model_config=moe_config) == {"moe", "kda", "lce"}
 
-    # Models without MoE kernels never look at the model config (or import torchtitan's MoE).
+    # Only a request that would select ``moe`` looks at the model config (or imports torchtitan's MoE), so models
+    # without MoE kernels, ``none`` and lists without ``moe`` never do.
     def traverse(cls):
         raise AssertionError("traversed")
 
-    assert resolve("qwen3", "auto", model_config=SimpleNamespace(traverse=traverse)) == frozenset()
+    untouched = SimpleNamespace(traverse=traverse)
+    assert resolve("qwen3", "auto", model_config=untouched) == frozenset()
+    for requested in ("none", "lce", "kda, lce"):
+        assert resolve("qwen3_5", requested, model_config=untouched) == resolve("qwen3_5", requested)
+    # Nor does ``auto`` on a torchtitan without the MoE kernels.
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset({"kda"}))
+    assert resolve("qwen3_5", "auto", model_config=untouched) == {"kda"}
 
 
 def test_model_kernels_explicit_lists_unchanged_and_explicit_moe_on_dense_fails(monkeypatch):
