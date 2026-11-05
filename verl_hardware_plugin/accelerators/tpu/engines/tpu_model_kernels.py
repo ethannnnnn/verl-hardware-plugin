@@ -21,6 +21,8 @@ The Pallas gated RMSNorm (https://github.com/google-pytorch/torchtitan/pull/80) 
 ``model_kernels``: ``auto`` (default) enables what the installed torchtitan exposes, so the same plugin runs both
 torchtitan ``main`` (nothing is enabled) and an optimized build (everything is enabled) with only the container
 image changed; ``none`` disables all; ``all`` enables every kernel of the model; or a comma-separated subset.
+``moe`` is a kernel of the model only if the flavor has MoE layers: ``auto`` and ``all`` leave it out for a dense
+flavor (e.g. Qwen3.5-0.8B), and an explicit ``moe`` fails there.
 
 Some models also need a mandatory TPU setup, independent of ``model_kernels``: ``model_setup`` looks it up in
 ``_MODEL_SETUPS`` (today Qwen3 MoE). Add a ``ModelSetup`` entry there for a new model; the engine stays unchanged.
@@ -42,6 +44,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # The optional kernels each torchtitan model supports.
 _SUPPORTED_KERNELS = {"qwen3_5": frozenset({"moe", "kda", "lce"})}
+# The optional kernels that need MoE layers (the TPU MoE converters have nothing to convert in a dense flavor).
+_MOE_KERNELS = frozenset({"moe"})
 
 # Not ``qwen2_moe``: torchtitan's qwen3 model has no Qwen2-MoE shared expert.
 _QWEN3_MOE_HF_MODEL_TYPES = frozenset({"qwen3_moe"})
@@ -105,25 +109,45 @@ def _available_kernels(torchtitan_name: str) -> frozenset[str]:
     return frozenset(kernels)
 
 
-def resolve_tpu_model_kernels(torchtitan_name: str, requested: Optional[str] = None) -> frozenset[str]:
+def has_moe_layers(model_config: Any) -> bool:
+    """Whether torchtitan model config ``model_config`` has MoE layers, which the ``moe`` kernels run on."""
+    from torchtitan.models.common.moe import MoE
+
+    return any(True for _ in model_config.traverse(MoE.Config))
+
+
+def resolve_tpu_model_kernels(
+    torchtitan_name: str, requested: Optional[str] = None, model_config: Any = None
+) -> frozenset[str]:
     """The optional kernels that torchtitan model ``torchtitan_name`` runs, from ``engine_kwargs.tpu.model_kernels``.
 
+    ``model_config`` is the torchtitan model config of the flavor. If it has no MoE layers, ``auto`` and ``all``
+    leave out the MoE kernels. ``None`` skips this check.
+
     Raises:
-        ValueError: on a kernel name that ``torchtitan_name`` does not support, or that the installed torchtitan
-            does not provide.
+        ValueError: on a kernel name that ``torchtitan_name`` does not support, that needs MoE layers that
+            ``model_config`` does not have, or that the installed torchtitan does not provide.
     """
     supported = _SUPPORTED_KERNELS.get(torchtitan_name, frozenset())
+    # The kernels of the model that this flavor cannot run: the MoE kernels of a dense flavor.
+    dense = model_config is not None and bool(supported & _MOE_KERNELS) and not has_moe_layers(model_config)
+    inapplicable = supported & _MOE_KERNELS if dense else frozenset()
     raw = (requested or "").strip().lower()
     if not raw or raw == "auto":
-        return _available_kernels(torchtitan_name) & supported
+        return _available_kernels(torchtitan_name) & (supported - inapplicable)
     names = {k.strip() for k in raw.split(",") if k.strip()}
     if names <= {"none", "off", "false", "0"}:
         return frozenset()
     if "all" in names:
-        names = set(supported)
+        names = set(supported - inapplicable)
     unknown = names - supported
     if unknown:
         raise ValueError(f"engine_kwargs.tpu.model_kernels: {sorted(unknown)} not supported for {torchtitan_name}")
+    if names & inapplicable:
+        raise ValueError(
+            f"engine_kwargs.tpu.model_kernels: {sorted(names & inapplicable)} needs MoE layers, but this "
+            f"{torchtitan_name} flavor has none (dense); remove it or use 'auto'"
+        )
     missing = names - _available_kernels(torchtitan_name)
     if missing:
         raise ValueError(
