@@ -194,6 +194,13 @@ class TPUEngineOptions:
             ``tie_word_embeddings=true``, also for models whose torchtitan config trains a separate LM head (e.g.
             Qwen3.5-0.8B; see ``engines/tied_embeddings.py``). Unset or ``False`` (default) keeps the torchtitan
             config's own choice.
+        embed_head_accum: With SimpleFSDP, accumulate the input embedding and LM head gradients of a training step's
+            micro-batches locally and reduce-scatter them once per step, instead of one all-gather and one
+            reduce-scatter per micro-batch (default: ``False``). These two modules run eagerly outside the compiled
+            TransformerBlocks, so their collectives do not overlap with compute. Their gradients then match the
+            default path to rounding (different summation order); the gathered weights and full-size gradient
+            buffers stay allocated during the micro-batch loop. Tied embeddings are supported. See
+            ``engines/embed_head_grad_accum.py``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -217,6 +224,7 @@ class TPUEngineOptions:
     fixed_shape_response_len: Optional[int] = None
     fixed_shape_prewarm: Optional[bool] = None
     tie_embeddings: Optional[bool] = None
+    embed_head_accum: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -241,6 +249,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "fixed_shape_response_len": int,
     "fixed_shape_prewarm": bool,
     "tie_embeddings": bool,
+    "embed_head_accum": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
