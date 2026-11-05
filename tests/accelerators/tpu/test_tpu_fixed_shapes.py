@@ -151,14 +151,25 @@ def _check_plan(lens, plan, max_seqs):
         assert sum(lens[i] for i in bins) <= cap
 
 
-def _random_lens(rng, n, cap=4352):
-    """Prompt + response lengths of RL rollouts: short prompts, mostly short responses, some at the maximum."""
-    lens = []
-    for _ in range(n):
-        prompt = rng.randint(60, 240)
-        response = 4096 if rng.random() < 0.12 else min(4096, int(rng.expovariate(1 / 700)) + 1)
-        lens.append(min(cap, prompt + response))
-    return lens
+# Synthetic RL rollouts for the planner tests, given as deciles (token counts at cumulative probability 0, 0.1, ..., 1)
+# and sampled by inverse transform with linear interpolation. Responses are mostly short with a long tail, and the top
+# decile stops at the 4096-token generation limit. The longest sequence, 256 + 4096 = 4352 tokens, is the shortest row
+# of the packing test.
+PROMPT_DECILES = (16, 32, 48, 64, 80, 100, 120, 144, 172, 208, 256)
+RESPONSE_DECILES = (1, 48, 120, 210, 330, 490, 700, 1000, 1500, 4096, 4096)
+
+
+def _from_deciles(deciles, u):
+    """The length at cumulative probability ``u`` (in [0, 1)) of the piecewise-linear distribution ``deciles``."""
+    pos = u * (len(deciles) - 1)
+    i = int(pos)
+    return round(deciles[i] + (pos - i) * (deciles[i + 1] - deciles[i]))
+
+
+def _synthetic_lengths(rng, n):
+    """``n`` packed sequence lengths (prompt plus response tokens), reproducible from the ``random.Random`` ``rng``."""
+    draws = [(rng.random(), rng.random()) for _ in range(n)]
+    return [_from_deciles(PROMPT_DECILES, a) + _from_deciles(RESPONSE_DECILES, b) for a, b in draws]
 
 
 # Synthetic per-row costs, super-linear in the row length: two short rows can be cheaper than one long row.
@@ -170,7 +181,7 @@ def test_pack_invariants_on_random_inputs():
     packed = 0
     for _ in range(300):
         n = rng.randint(1, 80)
-        lens = _random_lens(rng, n)
+        lens = _synthetic_lengths(rng, n)
         caps = sorted((rng.choice([4352, 8192, 12288, 16384]) for _ in range(rng.randint(1, min(n, 12)))), reverse=True)
         max_seqs = rng.choice([8, 16, 32, 64])
         bins = fs.pack(lens, caps, max_seqs)
@@ -191,7 +202,7 @@ def test_plan_layout_agrees_across_ranks_and_is_cheapest():
     rng = random.Random(1)
     rows = tuple(COSTS)
     for _ in range(25):
-        rank_lens = [_random_lens(rng, 64) for _ in range(rng.choice([2, 4, 8]))]
+        rank_lens = [_synthetic_lengths(rng, 64) for _ in range(rng.choice([2, 4, 8]))]
         max_seqs = rng.choice([32, 64])
         plans = _lockstep_plans(rank_lens, rows, max_seqs, COSTS)
         assert len({plan.caps for plan in plans}) == 1
@@ -228,7 +239,7 @@ def _gloo_plan_worker(rank, world, init_file, out_dir):
 
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
     try:
-        lens = _random_lens(random.Random(100 + rank), 64)
+        lens = _synthetic_lengths(random.Random(100 + rank), 64)
         if rank == world - 1:
             lens[:10] = [4352] * 10  # a heavier rank
         rows = (8192, 12288, 16384)
