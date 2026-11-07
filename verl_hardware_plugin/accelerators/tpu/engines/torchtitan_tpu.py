@@ -35,6 +35,7 @@ import math
 import os
 import re
 import shutil
+from collections import deque
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any, Callable, Iterator, Optional
@@ -57,6 +58,7 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_optimizer,
 )
+from verl.utils.metric.deferred import defer_host_scalars, host_copy, host_scalar
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits_naive
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
@@ -113,6 +115,70 @@ from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Host syncs of training micro-batches (verl.utils.metric.deferred):
+#   "cut"  the metric / loss .item() and bool() reads and the log-prob host copy are read once after the micro-batch
+#          loop; at each former sync point the deferred tensor is materialized without waiting (torch_tpu synchronize(t,
+#          wait=False)), so the deferred-graph cut points, and with them the compiled programs, stay exactly as before
+#   "fuse" the same without the cuts (the loss glue and its metrics become one deferred graph per micro-batch)
+#   "off"  read each value where it is computed (eager)
+_HOST_SCALARS_MODE = "cut"
+# Micro-batches end without a device drain, except the last one; at most this many finished-dispatch micro-batches may
+# still be running on the device while the host dispatches the next one (bounds the activations in HBM).
+_MICRO_BATCH_RUNAHEAD = 1
+
+
+def _host_scalar_scope():
+    """The deferral scope of one training forward/backward pass (see ``_HOST_SCALARS_MODE``)."""
+    if _HOST_SCALARS_MODE == "off":
+        return nullcontext(None)
+    if _HOST_SCALARS_MODE == "cut":
+        return defer_host_scalars(materialize=functools.partial(tpu_synchronize, wait=False))
+    if _HOST_SCALARS_MODE == "fuse":
+        return defer_host_scalars()
+    raise ValueError(f"unknown _HOST_SCALARS_MODE {_HOST_SCALARS_MODE!r}")
+
+
+def _record_device_event() -> Any:
+    """A completion marker for everything enqueued on this process's device so far (torch_tpu: MaterializeStream + an
+    event snapshot; ``.synchronize()`` waits for it). Only TPU events are used: on other devices (e.g. the CPU tests,
+    where an event can be recorded but not waited on) this raises, and the fence drains after every micro-batch."""
+    device = torch.device(get_device_name())
+    if device.type != "tpu":
+        raise RuntimeError(f"micro-batch fence events need a TPU device, not {device.type}")
+    event = torch.Event(device=device)
+    event.record()
+    return event
+
+
+class _MicroBatchFence:
+    """Bounds how far the host runs ahead of the device when micro-batches end without a drain.
+
+    After micro-batch k is flushed (``tpu_synchronize(wait=False)``) the host records a device event and waits for the
+    event of micro-batch ``k - depth``: the host prepares and dispatches micro-batch k + 1 while the device runs k,
+    and at most ``depth + 1`` micro-batches hold activations. If no event can be recorded, every later micro-batch is
+    drained instead (``tpu_synchronize(wait=True)``, the behaviour without the fence).
+    """
+
+    _disabled = False
+
+    def __init__(self, depth: int):
+        self.depth = int(depth)
+        self.events: deque = deque()
+
+    def after_flush(self) -> None:
+        if not _MicroBatchFence._disabled:
+            try:
+                self.events.append(_record_device_event())
+            except Exception as e:  # pylint: disable=broad-except
+                _MicroBatchFence._disabled = True
+                logger.warning("micro-batch fence: no device event (%r); draining after every micro-batch instead", e)
+        if _MicroBatchFence._disabled:
+            self.events.clear()
+            tpu_synchronize(wait=True)
+            return
+        while len(self.events) > self.depth:
+            self.events.popleft().synchronize()
+
 
 def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
     """Jagged view of a per-token output; for bucket-padded outputs a CPU view that carries the padded device tensor.
@@ -121,7 +187,10 @@ def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Opt
     """
     if orig_seq_len is None:
         return torch.nested.nested_tensor_from_jagged(padded, cu_seqlens)
-    jagged = torch.nested.nested_tensor_from_jagged(padded.detach().cpu()[:orig_seq_len], cu_seqlens.detach().cpu())
+    # padded.detach().cpu(); in a training pass's host-scalar scope, filled after the micro-batch loop (nothing reads it
+    # earlier: the loss reads the padded device tensor)
+    values = host_copy(padded.detach())[:orig_seq_len]
+    jagged = torch.nested.nested_tensor_from_jagged(values, cu_seqlens.detach().cpu())
     setattr(jagged, TPU_PADDED_VALUES_ATTR, padded)
     return jagged
 
@@ -1421,11 +1490,25 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), embed_head_ctx:
+        # Training: host scalars read once after the loop; no drain between micro-batches (bounded run-ahead).
+        scalar_scope = _host_scalar_scope() if not forward_only else nullcontext(None)
+        fence = _MicroBatchFence(_MICRO_BATCH_RUNAHEAD)  # used by training passes only
+        last = len(micro_batches) - 1
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), embed_head_ctx, scalar_scope as scope:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                    output = self._forward_backward_micro_batch(micro_batch, loss_function, forward_only)
+                    if forward_only:
+                        output = self._forward_backward_micro_batch(micro_batch, loss_function, forward_only)
+                    else:
+                        drain = micro_batch_idx == last
+                        output = self._forward_backward_micro_batch(
+                            micro_batch, loss_function, forward_only, drain=drain
+                        )
+                        if not drain:
+                            fence.after_flush()
                 output_lst.append(output)
+            if scope is not None:
+                scope.resolve(output_lst)
 
         output = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
         if fixed_shapes is not None:
@@ -1433,9 +1516,13 @@ class TorchTitanTPUEngine(BaseEngine):
         return output
 
     def _forward_backward_micro_batch(
-        self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool
+        self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool, drain: bool = True
     ) -> dict[str, Any]:
-        """Forward (and backward unless ``forward_only``) of one micro-batch; returns its ``forward_step`` output."""
+        """Forward (and backward unless ``forward_only``) of one micro-batch; returns its ``forward_step`` output.
+
+        With ``drain=False`` the micro-batch ends with a non-blocking device-wide materialization instead of a drain
+        (the same deferred-graph cut, without the host wait).
+        """
         loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
         if not forward_only:
             with spmd_no_typecheck_context():
@@ -1444,7 +1531,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 tpu_synchronize(loss, wait=False)
                 loss.backward()
                 del loss
-                tpu_synchronize(wait=True)
+                tpu_synchronize(wait=drain)
         else:
             del loss
         return output
@@ -1466,8 +1553,11 @@ class TorchTitanTPUEngine(BaseEngine):
         """Compiles and times every fixed-shape row length once (``tpu_fixed_shapes.prewarm``)."""
 
         def run_micro_batch(micro_batch: TensorDict) -> None:
-            with self.trainer.train_context():
-                self._forward_backward_micro_batch(micro_batch, loss_function, forward_only=False)
+            # The training micro-batch's host-scalar scope (the same programs as the loop), drained after every run.
+            with self.trainer.train_context(), _host_scalar_scope() as scope:
+                output = self._forward_backward_micro_batch(micro_batch, loss_function, forward_only=False)
+                if scope is not None:
+                    scope.resolve(output)
 
         with tpu_eager_mode_context(self._tpu_eager_mode):
             tpu_fixed_shapes.prewarm(data, fixed_shapes, run_micro_batch, self.optimizer_zero_grad)
@@ -2319,7 +2409,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 output = {
                     "model_output": detach_tree(model_output),
-                    "loss": loss.detach().item(),
+                    # loss.detach().item(); in a training pass's host-scalar scope, read after the micro-batch loop
+                    "loss": host_scalar(loss.detach()),
                     "metrics": metrics,
                 }
 
