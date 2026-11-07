@@ -257,3 +257,11 @@ def test_embed_head_accum_option_is_off_by_default():
         assert get_tpu_engine_options(_cfg({"embed_head_accum": raw})).embed_head_accum is expected
     with pytest.raises(ValueError, match="Invalid TPU engine option embed_head_accum"):
         get_tpu_engine_options(_cfg({"embed_head_accum": "sometimes"}))
+
+
+def test_selective_ac_recompute_bmm_option_is_off_by_default():
+    assert get_tpu_engine_options(_cfg()).selective_ac_recompute_bmm is None
+    for raw, expected in ((True, True), ("true", True), ("false", False), (0, False)):
+        assert get_tpu_engine_options(_cfg({"selective_ac_recompute_bmm": raw})).selective_ac_recompute_bmm is expected
+    with pytest.raises(ValueError, match="Invalid TPU engine option selective_ac_recompute_bmm"):
+        get_tpu_engine_options(_cfg({"selective_ac_recompute_bmm": "sometimes"}))

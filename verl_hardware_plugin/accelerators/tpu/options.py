@@ -201,6 +201,11 @@ class TPUEngineOptions:
             default path to rounding (different summation order); the gathered weights and full-size gradient
             buffers stay allocated during the micro-batch loop. Tied embeddings are supported. See
             ``engines/embed_head_grad_accum.py``.
+        selective_ac_recompute_bmm: With ``activation_checkpoint=selective``, recompute batched matmul
+            (``aten.bmm``) outputs in backward instead of saving them (default: ``False``). Saving them hands one
+            tensor per bmm from each compiled block's forward program to its backward program; the XLA
+            GatedDeltaNet recurrence of Qwen3.5 runs three bmm per 64-token chunk. The values are unchanged (the
+            same ops run on the same inputs); see ``engines/tpu_selective_ac.py``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -225,6 +230,7 @@ class TPUEngineOptions:
     fixed_shape_prewarm: Optional[bool] = None
     tie_embeddings: Optional[bool] = None
     embed_head_accum: Optional[bool] = None
+    selective_ac_recompute_bmm: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -250,6 +256,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "fixed_shape_prewarm": bool,
     "tie_embeddings": bool,
     "embed_head_accum": bool,
+    "selective_ac_recompute_bmm": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

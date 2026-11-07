@@ -998,6 +998,15 @@ class TorchTitanTPUEngine(BaseEngine):
                 "full": FullAC.Config,
                 "none": lambda: None,
             }[ac_mode]()
+            # The flags of the selective-AC policy, torchtitan's TPUSelectiveAC (engines/tpu_selective_ac.py):
+            # engine_kwargs.tpu.selective_ac_recompute_bmm -> recompute_bmm; the splash forward (save_pallas_attention)
+            # and the GatedDeltaNet UT solve (save_triangular_solve) from the module's defaults. Other modes and
+            # forward_only: unchanged.
+            from verl_hardware_plugin.accelerators.tpu.engines import tpu_selective_ac
+
+            activation_checkpoint = tpu_selective_ac.selective_ac_config(
+                activation_checkpoint, ac_mode, recompute_bmm=bool(tpu_options.selective_ac_recompute_bmm)
+            )
 
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
