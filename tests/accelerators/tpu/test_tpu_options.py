@@ -261,3 +261,11 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_tie_embeddings_option():
+    assert get_tpu_engine_options(_cfg()).tie_embeddings is None  # off: the torchtitan model config decides
+    assert get_tpu_engine_options(_cfg({"tie_embeddings": "true"})).tie_embeddings is True
+    assert get_tpu_engine_options(_cfg({"tie_embeddings": False})).tie_embeddings is False
+    with pytest.raises(ValueError, match="Invalid TPU engine option tie_embeddings"):
+        get_tpu_engine_options(_cfg({"tie_embeddings": "maybe"}))
